@@ -1,0 +1,363 @@
+#include <winsock2.h>
+#include <Ws2tcpip.h>
+
+#include <iostream>
+#include <unordered_map>
+#include <vector>
+#include <string>
+#include <chrono>
+
+#include <SDL.h>
+#include <SDL_image.h>
+
+#define MAX_CLIENTS 255
+
+using namespace std;
+
+class Game {
+public:
+	Game() {
+		window = NULL;
+		renderer = NULL;
+		playerTexture = NULL;
+
+		connectedPlayers = 0;
+		ID = 0;
+		connectedToServer = false;
+
+		timeOfPrevFrame = 0;
+
+		clientMsgNum = 0;
+		sock = NULL;
+		serverAddress = {0};
+	}
+
+	~Game() {
+		WSACleanup();
+
+		SDL_DestroyTexture(playerTexture);
+		playerTexture = NULL;
+
+		SDL_DestroyRenderer(renderer);
+		renderer = NULL;
+
+		SDL_DestroyWindow(window);
+		window = NULL;
+
+		IMG_Quit();
+		SDL_Quit();
+
+		//char input;
+		//cin >> input;
+	}
+
+	void initSDL() {
+		if (SDL_Init(SDL_INIT_TIMER | SDL_INIT_VIDEO) < 0) {
+			cout << "Couldn't initialize sdl: " << SDL_GetError() << endl;
+		}
+
+		if ((IMG_Init(IMG_INIT_PNG) & IMG_INIT_PNG) != IMG_INIT_PNG) {
+			cout << "Couldn't initialize SDL_image: " << IMG_GetError() << endl;
+		}
+
+		window = SDL_CreateWindow("Multiplayer testing", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 500, 500, SDL_WINDOW_SHOWN);
+		if (window == NULL) {
+			cout << "Couldn't create window: " << SDL_GetError() << endl;
+		}
+
+		renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+		if (renderer == NULL) {
+			cout << "Couldn't create renderer: " << SDL_GetError() << endl;
+		}
+
+		SDL_SetRenderDrawColor(renderer, 201, 254, 237, 255);
+	}
+
+	void initWinsock() {
+		WSAData winsockData;
+		if (WSAStartup(0x202, &winsockData)) {
+			cout << "Failed to start winsock: " << WSAGetLastError();
+		}
+
+		sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+		if (sock == INVALID_SOCKET) {
+			cout << "Couldn't create the UDP socket: " << WSAGetLastError();
+		}
+
+		// Put socket in non-blocking mode
+		u_long argp = 1;
+		ioctlsocket(sock, FIONBIO, &argp);
+
+		serverAddress.sin_family = AF_INET;
+		serverAddress.sin_port = htons(5555);
+		inet_pton(AF_INET, "127.0.0.1", &serverAddress.sin_addr.S_un.S_addr);
+	}
+
+	void load() {
+		SDL_Surface* surface = IMG_Load("player.png");
+		if (surface == NULL) {
+			cout << "IMG_Load() failed for some reason: " << IMG_GetError() << endl;
+		}
+
+		playerTexture = SDL_CreateTextureFromSurface(renderer, surface);
+		if (playerTexture == NULL) {
+			cout << "Failed to create the texture for some reason: " << SDL_GetError() << endl;
+		}
+
+		SDL_FreeSurface(surface);
+	}
+
+	void loop() {
+		// Send a join message to the server
+		buffer[0] = (byte)clientDataTypes::join;
+		if (sendto(sock, (char*)buffer, 1, 0, (SOCKADDR*)&serverAddress, sizeof(serverAddress)) == SOCKET_ERROR) {
+			cout << "Join message failed to send\n";
+			return;
+		}
+
+		timeOfPrevFrame = SDL_GetTicks() / 1000.0;
+
+		bool quit = false;
+		while (!quit) {
+			// Handle window events ///////////////
+			SDL_Event eventStructure;
+			while (SDL_PollEvent(&eventStructure) != 0) {
+				if (eventStructure.type == SDL_QUIT)
+					quit = true;
+			}
+			///////////////////////////////////////
+
+			// Draw stuff ///////////////////////////////
+			SDL_RenderClear(renderer);
+			
+			// Draw every player
+			for (auto client : players) {
+				SDL_Rect destRect = { client.second.xPos, client.second.yPos, 32, 32 };
+				SDL_RenderCopy(renderer, playerTexture, NULL, &destRect);
+			}
+
+			SDL_RenderPresent(renderer);
+			//////////////////////////////////////////
+
+			SOCKADDR_IN recvAddress;
+			int recvAddressSize = sizeof(recvAddress);
+
+			//!!!!!!!!!!!!!! VERY IMPORTANT NOTE !!!!!!!!!!!!!//
+			// Need a while loop to recv ALL packets from the server. This is very important. If we don't do this, some packets won't be received this tick.
+			// This creates the appearance of high ping, even in a LAN. This was the cause of a very annoying bug. I spent hours trying to figure out why it 
+			// looked like I had 200ms of ping on my local network. Turns out it was because I was using an if statement instead of a while, so I was only getting
+			// 1 packet per tick. Big shame. Be warned future self, if you ever use similar netcode.
+			while (recvfrom(sock, (char*)buffer, (MAX_CLIENTS * 13 + 5), 0, (SOCKADDR*)&recvAddress, &recvAddressSize) != SOCKET_ERROR) {
+				switch (buffer[0]) {
+					case (byte)serverDataTypes::joinResult:
+						// If the server let us in then store our id
+						if (buffer[1] == 1) {
+							ID = buffer[2];
+							connectedToServer = true;
+							cout << "Connected to server\n";
+						}
+						// Otherwise you can just vibe like the hacker you are
+						else
+							cout << "Warning: server denied join request\n";
+					break;
+
+					case (byte)serverDataTypes::gameState:
+						// Delete all of the players, they will be reassigned in the state packet receival if the player still exists. This seems like a good way to
+						// prevent having map elements of players that no longer exist, but IDK. TODODODO: is this method too performance costly?
+						//players.clear();
+
+						// The data received from the server in the form of a buffer has a certain structure. The first byte indicates that the data is the game state
+						// After the first byte, there are sections of 13 bytes for each client. The first byte of a section specifies the client's ID
+						// The next 8 bytes hold the x and y positions of the player (in the form of 4-byte integers).
+						// The last 4 bytes holds the ID of the client-input-message that the server has most recently processed. Used in the client side prediction
+
+						connectedPlayers = buffer[1];
+						//cout << "Received game state from server.\nconnectedPlayers: " << (int)connectedPlayers << "\nx-coord: " << (int)buffer[2 + 0 * 9] << "\ny-coord: " << (int)buffer[6 + 0 * 9] << endl;
+						
+						for (byte i = 0; i < connectedPlayers; i++) {
+							// Get the input number for this state
+							unsigned int lastProcessedInputNum = 0;
+							memcpy(&lastProcessedInputNum, &buffer[11 + i * 13], 4);
+
+							// And the id of this client as well
+							byte curID = buffer[2 + i * 13];
+
+							// If this client is us then we need to do some prediction stuff
+							if (ID == curID) {
+								// Copy the positions of each player to the map
+								memcpy(&players[curID].xPos, &buffer[3 + i * 13], 4);
+								memcpy(&players[curID].yPos, &buffer[7 + i * 13], 4);
+
+								// Since the server is authoritative and we just updated the client position with what it sent to us, we also need to reapply all
+								// inputs that the server has not yet processed. For example, say we had lots of lag, 300ms, and we moved twice to the right. Because
+								// we're doing CSP, we move the client instantly, so he gets to the right before the server data comes back for just the first key
+								// press. When it does get back, the player will move backwards and then forwards again as the second key press comes in. To solve this,
+								// look at the server reconciliation section: https://www.gabrielgambetta.com/client-side-prediction-server-reconciliation.html
+
+								int clientInputIndex = 0;
+								while (clientInputIndex < inputs.size()) {
+									// If the server has processed this input we dont care about it any more so we can delete it
+									if (inputs[clientInputIndex].inputNum <= lastProcessedInputNum)
+										inputs.erase(inputs.begin() + clientInputIndex);
+									// If the server has not processed this input yet we need to reapply it to keep up the illusion of 0 lag
+									else {
+										byte movementByte = inputs[clientInputIndex].movementByte;
+										if (movementByte & 1)
+											players[ID].yPos -= (int)(450 * inputs[clientInputIndex].dt);
+										if (movementByte & 2)
+											players[ID].xPos -= (int)(450 * inputs[clientInputIndex].dt);
+										if (movementByte & 4)
+											players[ID].yPos += (int)(450 * inputs[clientInputIndex].dt);
+										if (movementByte & 8)
+											players[ID].xPos += (int)(450 * inputs[clientInputIndex].dt);
+
+										clientInputIndex++;
+									}
+								}
+							}
+							else {
+								memcpy(&players[curID].xPos, &buffer[3 + i * 13], 4);
+								memcpy(&players[curID].yPos, &buffer[7 + i * 13], 4);
+							}
+						}
+					break;
+					/*default:
+						//connectedPlayers = 1;
+						int var = 0;
+						memcpy(&var, &buffer[0], 4);
+						players[0].xPos = var;
+						if(var > 0)
+							cout << "received: " << var << endl;
+					break;*/
+				}
+			}
+
+			// Handle key presses if we are connected //////////////////
+			if (connectedToServer == true) {
+				float elapsedTime = SDL_GetTicks() / 1000.0 - timeOfPrevFrame;
+				timeOfPrevFrame = SDL_GetTicks() / 1000.0;
+
+				const Uint8* keyboardState = SDL_GetKeyboardState(NULL);
+				Uint8 inputByte = 0;
+
+				// FOR CLIENT SIDE PREDICTION:
+				// When we send the data off to the server, we can update our local representation of the client. This will later be corrected
+				// (if it needs to be corrected) by the server when it sends us back the game state
+
+				// Set the first 4 bits to 1 based on which keys are pressed
+				if (keyboardState[SDL_SCANCODE_W]) {
+					inputByte |= 1;
+					players[ID].yPos -= (int)(450 * elapsedTime);
+
+					//auto duration = chrono::system_clock::now().time_since_epoch();
+					//cout << "W key pressed at time " << chrono::duration_cast<chrono::milliseconds>(duration).count() << endl;
+				}
+				if (keyboardState[SDL_SCANCODE_A]) {
+					inputByte |= 2;
+					players[ID].xPos -= (int)(450 * elapsedTime);
+				}
+				if (keyboardState[SDL_SCANCODE_S]) {
+					inputByte |= 4;
+					players[ID].yPos += (int)(450 * elapsedTime);
+					cout << "Y pos: " << players[ID].yPos << endl;
+				}
+				if (keyboardState[SDL_SCANCODE_D]) {
+					inputByte |= 8;
+					players[ID].xPos += (int)(450 * elapsedTime);
+				}
+
+				buffer[0] = (byte)clientDataTypes::input;
+				buffer[1] = ID;
+				buffer[2] = inputByte;
+
+				// The server needs to know the time since the last frame so they can move us properly
+				memcpy(&buffer[3], &elapsedTime, sizeof(elapsedTime));
+
+				// When the server sends the game state back to us, it will include 
+				memcpy(&buffer[7], &clientMsgNum, 4);
+
+				// Send to the server
+				sendto(sock, (char*)buffer, 11, 0, (SOCKADDR*)&serverAddress, sizeof(serverAddress));
+
+				// Add this input to the vector for later use
+				clientInput input = {inputByte, elapsedTime, clientMsgNum};
+				inputs.push_back(input);
+
+				clientMsgNum++;
+			}
+			//////////////////////////////////////////
+
+			buffer[0] = 0;
+		}
+
+		// Send leave message to server so the client slot can be reused instantly
+		if (connectedToServer == true) {
+			buffer[0] = (byte)clientDataTypes::leave;
+			buffer[1] = ID;
+			sendto(sock, (char*)buffer, 2, 0, (SOCKADDR*)&serverAddress, sizeof(serverAddress));
+		}
+	}
+
+private:
+	SOCKET sock;
+	SOCKADDR_IN serverAddress;
+
+	SDL_Window* window;
+	SDL_Renderer* renderer;
+	SDL_Texture* playerTexture;
+
+	// Simple 2d vector for player position
+	struct player {
+		int xPos;
+		int yPos;
+	};
+
+	// A struct containing data for a client input. The inputs vector uses this for it's elements
+	struct clientInput {
+		byte movementByte;
+		float dt;
+		unsigned int inputNum;
+	};
+
+	// All of the players in the game
+	unordered_map<byte, player> players;
+	// This vector is filled with the inputs that we have sent to the server. Used for CSP. We can loop over these inputs, and discard or re-apply them as needed
+	vector<clientInput> inputs;
+	// How many are currently connected
+	byte connectedPlayers;
+
+	byte ID;
+	bool connectedToServer;
+
+	byte buffer[MAX_CLIENTS * 13 + 5] = {};
+
+	float timeOfPrevFrame;
+	// This is incremented every message.
+	unsigned int clientMsgNum;
+
+	// The client will send 1 of 3 possible bytes at the start of their message
+	enum class clientDataTypes {
+		join = 1,   // Client is joining for the first time
+		leave = 2,  // Client is leaving
+		input = 3   // Client is sending their input to the server
+	};
+
+	// The server will send one of these 2 messages to the client
+	enum class serverDataTypes {
+		joinResult = 1,  // Client has previously requested to join the game, so the server sends back accepted (along with client ID) or denied
+		gameState = 2    // Server is sending game state to client
+	};
+};
+
+int main(int argc, char* args[]) {
+	Game game = Game();
+
+	game.initSDL();
+	game.initWinsock();
+
+	game.load();
+
+	game.loop();
+
+	return 0;
+}
