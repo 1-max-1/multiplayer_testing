@@ -3,16 +3,17 @@
 #include <windows.h>
 #include <iostream>
 #include <string>
-#include <stdlib.h>
-#include <chrono>
+#include <unordered_set>
 
 using namespace std;
 
-const float serverFrequency = 60.0;
+const float serverFrequency = 60.0f;
 
-int thingVariable = 0;
-
-#define MAX_CLIENTS 255
+#define MAX_CLIENTS 2
+#define CLIENTS_PER_GAME 2
+#if MAX_CLIENTS % CLIENTS_PER_GAME != 0
+#error MAX_CLIENTS cannot fit evenly into CLIENTS_PER_GAME. Please adjust values.
+#endif
 
 // The client will send 1 of 3 possible bytes at the start of their message
 enum class clientDataTypes {
@@ -29,22 +30,117 @@ enum class serverDataTypes {
 
 // A data structure for everything that a player/client contains
 struct player {
-	unsigned int address;
-	unsigned short port;
+	unsigned int address = 0;
+	unsigned short port = 0;
 
-	int x;
-	int y;
-
-	bool pressingUp;
-	bool pressingLeft;
-	bool pressingDown;
-	bool pressingRight;
-
+	int x = 0;
+	int y = 0;
 	// This holds the number of the latest client input the server has handled. Used in client side prediction
-	unsigned int lastProcessedInputNumber;
+	unsigned int lastProcessedInputNumber = 0;
+	// This will let us decide if we havent heard from a player in a while. We can then disconnect them, assuming they've crashed or something
+	float timeSinceLastMsg = 0.0f;
+
+	byte gameID = 0;
 };
 
+struct game {
+	byte connectedPlayers = 0;
+	unordered_set<byte> playerIDs;
+};
+
+byte buffer[MAX_CLIENTS * 13 + 5] = {};
+player players[MAX_CLIENTS];
+// Each game will be an array containing ID of all players in that game. Game #0 will be the lobby - players waiting to join actual games
+game games[MAX_CLIENTS / CLIENTS_PER_GAME + 1];
+
+void handleLobby() {
+	if (games[0].connectedPlayers < CLIENTS_PER_GAME) return;  // Cant do anything without enough players
+
+	cout << "Enough players in lobby -> starting match\n";
+
+	// Find a free game for all these lobby bois
+	byte gameID = 0;
+	for (byte g = 1; g < MAX_CLIENTS / CLIENTS_PER_GAME + 1; g++) {
+		if (games[g].connectedPlayers == 0) {
+			gameID = g;
+			break;
+		}
+	}
+
+	// Transfer all the lobby bois into their game
+	for (byte playerID : games[0].playerIDs) {
+		players[playerID].gameID = gameID;
+		games[gameID].playerIDs.insert(playerID);
+
+		///////// NEW PHYSICS SCENE SHOULD BE CREATED HERE, IF USING PHYSICS ENGINE ////////
+		players[playerID].x = 0;
+		players[playerID].y = 0;
+	}
+	games[gameID].connectedPlayers = CLIENTS_PER_GAME;
+	games[0].connectedPlayers = 0;
+	games[0].playerIDs.clear();
+}
+
+unsigned short createStatePacket(byte gameID) {
+	// If the game ID is 0 then this game is the lobby.
+	// We can just send "0 connected players" so the clients knows that this is lobby and they are waiting for people
+	if (gameID == 0) {
+		buffer[1] = 0;
+		return 2;
+	}
+
+	buffer[1] = games[gameID].connectedPlayers;
+	// Start at a 3-byte offset. The first byte contains the data for the packet type,
+	// the second byte is resreved for the number of connected players and the 3rd byte determines if player is in lobby
+	unsigned short bytesWritten = 2;
+
+	// Add to the buffer: the data for every client in the current game/match 
+	for (byte playerID : games[gameID].playerIDs) {
+		// After the first byte, there are sections of 13 bytes for each client. The first byte of a section specifies the client's ID
+		buffer[bytesWritten] = playerID;
+		bytesWritten += 1;
+
+		// The next 4 bytes hold the x-position of the client
+		memcpy(&buffer[bytesWritten], &players[playerID].x, 4);
+		bytesWritten += 4;
+
+		// Next 4 bytes hold the y-position of the player
+		memcpy(&buffer[bytesWritten], &players[playerID].y, 4);
+		bytesWritten += 4;
+
+		// Last 4 bytes hold the ID of the most recent client-input message the server has processed
+		memcpy(&buffer[bytesWritten], &players[playerID].lastProcessedInputNumber, 4);
+		bytesWritten += 4;
+	}
+
+	return bytesWritten;
+}
+
+void disconnectPlayer(byte clientID) {
+	cout << "Disconnecting player " << (int)clientID << endl;
+	// Remove player from game
+	byte gameID = players[clientID].gameID;
+	players[clientID] = {};
+	games[gameID].playerIDs.erase(clientID);
+	games[gameID].connectedPlayers--;
+
+	// Dont need to move everyone back to the lobby if this IS the lobby
+	if (gameID == 0) return;
+
+	// This is application specific but whenever a player disconnects I want their game to shutdown. This means that we need to move everyone back to the lobby
+	unordered_set<byte> ids = games[gameID].playerIDs;
+	games[gameID].connectedPlayers = 0;
+	games[gameID].playerIDs.clear();
+	for (byte id : ids) {
+		games[0].connectedPlayers++;
+		games[0].playerIDs.insert(id);
+		players[id].gameID = 0;
+		handleLobby();
+	}
+}
+
 int main() {
+	cout << "Starting server...\n";
 	WSAData winsockData;
 	if (WSAStartup(0x202, &winsockData)) {
 		cout << "Failed to start winsock: " << WSAGetLastError();
@@ -83,18 +179,7 @@ int main() {
 	LARGE_INTEGER counterFrequency;
 	QueryPerformanceFrequency(&counterFrequency);
 
-
-	byte buffer[MAX_CLIENTS * 13 + 5] = {};
-
-	player players[MAX_CLIENTS];
-	// This will let us decide if we havent heard from a player in a while. We can then disconnect them, assuming they've crashed or something
-	float timeSinceLastClientMsg[MAX_CLIENTS];
-
-	// Set every player address to 0. Makes it easier to check for empty client positions
-	for (byte i = 0; i < MAX_CLIENTS; i++) {
-		players[i].address = 0;
-		timeSinceLastClientMsg[i] = 0.0f;
-	}
+	cout << "Server started!\n";
 
 	bool quit = false;
 	while (!quit) {
@@ -109,7 +194,7 @@ int main() {
 		// Need a while loop to recv ALL packets from the client. This is very important. If we don't do this, some packets won't be received this tick.
 		// This creates the appearance of high ping, even in a LAN. This was the cause of a very annoying bug. I spent hours trying to figure out why it 
 		// looked like I had 200ms of ping on my local network. Turns out it was because I was using an if statement instead of a while, so I was only getting
-		// 1 packet per tick. Big shame. Be warned future self, if you ever use similar netcode.
+		// 1 packet per tick. RIPPPPPPPPPPPPPPPPPPPPP. Be warned future self, if you ever use similar netcode.
 		while (recvfrom(sock, (char*)buffer, 11, 0, (SOCKADDR*)&recvAddress, &recvAddressSize) != SOCKET_ERROR) {
 			byte clientID;
 			bool clientIDSet = false;
@@ -123,7 +208,8 @@ int main() {
 					// Go through every client to check their address
 					for (byte i = 0; i < MAX_CLIENTS; i++) {
 						// If we already have the client's address in our array, then this client is forging join messages for some reason, maybe they tryin
-						// to dos the server. In that case, we shouldn't let that player join because they could do bad stuff.
+						// to dos the server. In that case, we shouldn't let that player join because they could do bad stuff. The other reason is they didnt
+						// get our response so they are resending the join message. In that case we can just ignore it as well.
 						if (recvAddress.sin_addr.S_un.S_addr == players[i].address && recvAddress.sin_port == players[i].port) break;
 
 						// If they aren't hacking, and we found a slot with the address as 0,
@@ -131,6 +217,7 @@ int main() {
 						if (players[i].address == 0) {
 							clientID = i;
 							clientIDSet = true;
+							break;
 						}
 					}
 
@@ -138,53 +225,48 @@ int main() {
 					buffer[1] = (byte)clientIDSet;
 					buffer[2] = clientID;
 
-					// Send the data back to the client. If the client ID was succesfully set then we will have a new client joining.
-					// We need to add them to the players array.
-					if (sendto(sock, (char*)buffer, 3, 0, (SOCKADDR*)&recvAddress, sizeof(recvAddress)) != SOCKET_ERROR && clientIDSet == true) {
+					// Send the data back to the client.
+					if (sendto(sock, (char*)buffer, 4, 0, (SOCKADDR*)&recvAddress, sizeof(recvAddress)) != SOCKET_ERROR) {
 						// Initialize player input and position to zero
-						players[clientID] = { recvAddress.sin_addr.S_un.S_addr, recvAddress.sin_port, 0, 0, 0, 0, 0, 0};
+						players[clientID] = { recvAddress.sin_addr.S_un.S_addr, recvAddress.sin_port, 0, 0, 0, 0.0f, 0};
+
+						// Add player to lobby then create new game if enough players are in there
+						games[0].connectedPlayers++;
+						games[0].playerIDs.insert(clientID);
+						handleLobby();
+
 						cout << "Client joined.   Address: " << recvAddress.sin_addr.S_un.S_addr << "   Port: " << recvAddress.sin_port << endl;
-						timeSinceLastClientMsg[clientID] = 0.0f;
+					}
+					else {
+						cout << WSAGetLastError() << endl;
 					}
 				break;
 
 				case (byte)clientDataTypes::leave:
 					cout << "Client leaving\n";
 					clientID = buffer[1];
-
 					// Make sure that the client isn't pretending to be another player. Otherwise they could just go around disconnecting everyone.
 					// We can then reset all of their variables
 					if (recvAddress.sin_addr.S_un.S_addr == players[clientID].address && recvAddress.sin_port == players[clientID].port)
-						players[clientID] = {};
+						disconnectPlayer(clientID);
 
 				break;
 
 				case (byte)clientDataTypes::input:
-					//cout << "Client sending input\n";
 					clientID = buffer[1];
 					// Make sure that the client isn't pretending to be another player. Otherwise they could move other players
 					if (recvAddress.sin_addr.S_un.S_addr == players[clientID].address && recvAddress.sin_port == players[clientID].port) {
-
-						// Handle player input
-						byte movementByte = buffer[2];
-
-						players[clientID].pressingUp = movementByte & 1;
-						players[clientID].pressingLeft = movementByte & 2;
-						players[clientID].pressingDown = movementByte & 4;
-						players[clientID].pressingRight = movementByte & 8;
-
 						// We can reset the timeout timer since we have received stuff from the client
-						timeSinceLastClientMsg[clientID] = 0.0f;
+						players[clientID].timeSinceLastMsg = 0.0f;
 
 						// This is the time since the clients last frame. Use this to move them independent of frame rate
 						float dt = 0;
 						memcpy(&dt, &buffer[3], 4);
 
-						if (movementByte & 1) {
-							/*auto duration = chrono::system_clock::now().time_since_epoch();
-							cout << "Handling W key press at time " << chrono::duration_cast<chrono::milliseconds>(duration).count() << endl;*/
+						///////// Handle player input //////////////////////
+						byte movementByte = buffer[2];
+						if (movementByte & 1)
 							players[clientID].y -= (int)(450 * dt);
-						}
 						if (movementByte & 2)
 							players[clientID].x -= (int)(450 * dt);
 						if (movementByte & 4)
@@ -200,98 +282,36 @@ int main() {
 			}
 		}
 
-		// Move the players
+		// Handle disconnected players
 		for (byte i = 0; i < MAX_CLIENTS; i++) {
 			if (players[i].address == 0) continue;
 
 			// If we haven't heard from a client in the last 5 seconds they have probably disconnected from a game or network crash, or just a rage quit lol
-			timeSinceLastClientMsg[i] += 1.0f / serverFrequency;
-			if (timeSinceLastClientMsg[i] > 5)
-				// Reset player variables
-				players[i] = {};
-
-			/*if (players[i].pressingUp) {
-				//auto duration = chrono::system_clock::now().time_since_epoch();
-				//cout << "Handling W key press at time " << chrono::duration_cast<chrono::milliseconds>(duration).count() << endl;
-				players[i].y -= (int)(300 / serverFrequency);
+			players[i].timeSinceLastMsg += 1.0f / serverFrequency;
+			if (players[i].timeSinceLastMsg > 5) {
+				disconnectPlayer(i);
+				cout << "Player timed out. Diconnecting...\n";
 			}
-			if (players[i].pressingLeft)
-				players[i].x -= (int)(300 / serverFrequency);
-			if (players[i].pressingDown)
-				players[i].y += (int)(300 / serverFrequency);
-			if (players[i].pressingRight) {
-				players[i].x += (int)(300 / serverFrequency);
-				thingVariable += 5;
-				//thingVariable = rand() % 100;
-				//cout << "Pressing right: " << thingVariable << endl;
-			}
-
-			timeSinceLastClientMsg[i] += 1.0f / serverFrequency;
-			if (timeSinceLastClientMsg[i] > 5)
-				players[i] = {};*/
 		}
 
-		// Now we can create the state packet. We can't do this in the previous loop because a player with a bigger ID coud push a player with a smaller ID,
-		// and it wouldn't get put in. The clients would then be out of sync for a bit.
-		// The first byte of the packet indicates that it is a game state packet
+		// Now we can create the state packets for each game. The first byte of the packet indicates that it IS a game state packet.
 		buffer[0] = (byte)serverDataTypes::gameState;
-		// Start at a 2-byte offset. The first byte contains the data for the above line of code,
-		// and the second byte is resreved for the number of connected players
-		unsigned short bytesWritten = 2;
-		byte connectedClients = 0;
 
-		for (byte i = 0; i < MAX_CLIENTS; i++) {
-			// No use for empty client
-			if (players[i].address == 0) continue;
+		for (byte g = 0; g < MAX_CLIENTS / CLIENTS_PER_GAME + 1; g++) {
+			// No use for empty game
+			if (games[g].connectedPlayers == 0) continue;
 
-			// After the first byte, there are sections of 13 bytes for each client. The first byte of a section specifies the client's ID
-			buffer[bytesWritten] = i;
-			bytesWritten += 1;
+			unsigned short bytesWritten = createStatePacket(g);
+			SOCKADDR_IN sendAddress;
+			sendAddress.sin_family = AF_INET;
 
-			// The next 4 bytes hold the x-position of the client
-			memcpy(&buffer[bytesWritten], &players[i].x, 4);
-			bytesWritten += 4;
-			
-			// Next 4 bytes hold the y-position of the player
-			memcpy(&buffer[bytesWritten], &players[i].y, 4);
-			bytesWritten += 4;
-
-			// Last 4 bytes hold the ID of the most recent client-input message the server has processed
-			memcpy(&buffer[bytesWritten], &players[i].lastProcessedInputNumber, 4);
-			bytesWritten += 4;
-
-			connectedClients++;
-		}
-		buffer[1] = connectedClients;
-
-		SOCKADDR_IN sendAddress;
-		sendAddress.sin_family = AF_INET;
-
-		for (byte i = 0; i < MAX_CLIENTS; i++) {
-			// No use for empty client
-			if (players[i].address == 0) continue;
-
-			sendAddress.sin_port = players[i].port;
-			sendAddress.sin_addr.S_un.S_addr = players[i].address;
-
-			//cout << "Player x: " << (int)buffer[2] << endl;
-			//int playerX = players[i].x;
-			//cout << "playerX: " << playerX << endl;
-			if (sendto(sock, (const char*)&buffer, bytesWritten, 0, (SOCKADDR*)&sendAddress, sizeof(sendAddress)) == SOCKET_ERROR) {
-				cout << "senderr:  " << WSAGetLastError() << endl;
+			// Now send the packet to every client in the current game/match
+			for (byte playerID : games[g].playerIDs) {
+				sendAddress.sin_port = players[playerID].port;
+				sendAddress.sin_addr.S_un.S_addr = players[playerID].address;
+				if (sendto(sock, (const char*)&buffer, bytesWritten, 0, (SOCKADDR*)&sendAddress, sizeof(sendAddress)) == SOCKET_ERROR)
+					cout << WSAGetLastError() << endl;
 			}
-
-			//int var = rand() % 100;
-			//if (var == 4) {
-				//cout << "sending " << thingVariable << endl;
-				//byte buf[5];
-				//buf[0] = 5;
-				//int v = 5;
-				//memcpy(&buf[1], &thingVariable, 4);
-				//cout << "Buffer: " << (int)buf[1] << endl;
-				//sendto(sock, (char*)&thingVariable, 5, 0, (SOCKADDR*)&sendAddress, sizeof(sendAddress));
-				//cout << "Sent\n";
-			//}
 		}
 
 		// Reset command
